@@ -18,6 +18,7 @@ public static class TextTools
         if (input.Length == 0) return true;
 
         // Normalize, keep only letters/digits, lowercase using Unicode rules.
+        
         var normalized = input.Normalize(NormalizationForm.FormC);
         var runes = new List<Rune>();
 

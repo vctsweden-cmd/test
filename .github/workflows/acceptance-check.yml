@@ -7,7 +7,7 @@ on:
 jobs:
   ac-check:
     runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     concurrency:
       group: ac-check-${{ github.ref }}
       cancel-in-progress: true
@@ -15,25 +15,29 @@ jobs:
       contents: read
       pull-requests: write
       checks: write
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-dotnet@v4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
 
-      # Unit tests intentionally disabled for now
+      # --- temporarily disabled unit tests ---
       # - name: Restore & test
       #   run: |
       #     dotnet restore
       #     dotnet test --logger "trx;LogFileName=test_results.trx" --results-directory ./TestResults
       #     echo "TEST_SUMMARY=$(grep -o 'Total tests:.*' TestResults/test_results.trx | tail -n1 || true)" >> $GITHUB_ENV
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install deps
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install requests PyGithub openai tiktoken
@@ -46,5 +50,8 @@ jobs:
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           JIRA_AC_FIELD_ID: ${{ secrets.JIRA_AC_FIELD_ID }}
-          # TEST_SUMMARY: ${{ env.TEST_SUMMARY }}
+          # TEST_SUMMARY: ${{ env.TEST_SUMMARY }}   # re-enable when tests are back
+          # DRY_RUN: "0"                             # set to "1" if you added a dry-run switch in your script
+          # MOCK_AI: "0"                             # set to "1" to stub the LLM during debugging
+          # MOCK_JIRA: "0"                           # set to "1" to use fixtures during debugging
         run: python .github/scripts/check_acceptance.py
