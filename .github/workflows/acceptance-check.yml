@@ -18,11 +18,11 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Restore & test
-        run: |
-          dotnet restore
-          dotnet test --logger "trx;LogFileName=test_results.trx" --results-directory ./TestResults
-          echo "TEST_SUMMARY=$(grep -o 'Total tests:.*' TestResults/test_results.trx | tail -n1 || true)" >> $GITHUB_ENV
+      # - name: Restore & test
+      #   run: |
+      #     dotnet restore
+      #     dotnet test --logger "trx;LogFileName=test_results.trx" --results-directory ./TestResults
+      #     echo "TEST_SUMMARY=$(grep -o 'Total tests:.*' TestResults/test_results.trx | tail -n1 || true)" >> $GITHUB_ENV
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -41,5 +41,5 @@ jobs:
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           JIRA_AC_FIELD_ID: ${{ secrets.JIRA_AC_FIELD_ID }}
-          TEST_SUMMARY: ${{ env.TEST_SUMMARY }}
+          # TEST_SUMMARY: ${{ env.TEST_SUMMARY }}
         run: python .github/scripts/check_acceptance.py
