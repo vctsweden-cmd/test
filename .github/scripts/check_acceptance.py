@@ -2,6 +2,9 @@ import os, re, json, base64, textwrap
 from typing import List, Dict
 import requests
 from github import Github
+DRY_RUN = os.getenv("DRY_RUN") == "1"       # don’t write to PR/Jira, just print
+MOCK_AI = os.getenv("MOCK_AI") == "1"       # replace the LLM with a stub
+MOCK_JIRA = os.getenv("MOCK_JIRA") == "1"   # serve Jira issue from a fixture file
 
 GITHUB_REPO = os.getenv("GITHUB_REPOSITORY")
 PR_NUMBER   = os.getenv("GITHUB_REF", "").split("/")[-1]  # fallback
