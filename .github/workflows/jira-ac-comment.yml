@@ -71,4 +71,95 @@ jobs:
             const auth = "Basic " + Buffer.from(email + ":" + token).toString("base64");
             const url  = baseUrl.replace(/\/+$/,"") + "/rest/api/3/issue/" + encodeURIComponent(key);
             const r = await fetch(url, { headers: { "Accept":"application/json", "Authorization": auth } });
-            if (
+            if (!r.ok) throw new Error("Jira fetch failed: " + r.status + " " + (await r.text()));
+            const issue = await r.json();
+
+            // Azure OpenAI helper (optional)
+            async function acViaAzure(issueJson) {
+              const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
+              const apiKey   = process.env.AZURE_OPENAI_API_KEY;
+              const apiVer   = process.env.AZURE_OPENAI_API_VERSION || "2024-02-15-preview";
+              const dep      = process.env.AZURE_OPENAI_DEPLOYMENT;
+              if (!endpoint || !apiKey || !dep) return null;
+              const azureUrl = endpoint.replace(/\/+$/,"") + "/openai/deployments/" + encodeURIComponent(dep) + "/chat/completions?api-version=" + encodeURIComponent(apiVer);
+              const messages = [
+                { role: "system", content: "Extract Acceptance Criteria from this Jira issue JSON. Prefer a dedicated AC custom field if present; otherwise parse the Description (Atlassian rich-text). Return ONLY Markdown bullets, one per criterion. If none, return '- (none found)'." },
+                { role: "user", content: "Issue JSON:\n" + JSON.stringify(issueJson) }
+              ];
+              const resp = await fetch(azureUrl, {
+                method: "POST",
+                headers: { "api-key": apiKey, "Content-Type": "application/json" },
+                body: JSON.stringify({ temperature: 0, messages })
+              });
+              if (!resp.ok) { core.warning("Azure OpenAI error " + resp.status + ": " + (await resp.text())); return null; }
+              const data = await resp.json();
+              return (data?.choices?.[0]?.message?.content || "").trim();
+            }
+
+            // Fallback parser (no AI)
+            function flattenADF(doc){
+              if (!doc || typeof doc !== "object") return "";
+              function walk(n){
+                if (!n) return "";
+                if (n.type === "text") return n.text || "";
+                const parts = (n.content || []).map(walk).join("");
+                if (n.type === "listItem") return "- " + parts + "\n";
+                if (n.type === "paragraph" || n.type === "heading") return parts + "\n";
+                return parts;
+              }
+              return walk(doc).replace(/\n{3,}/g, "\n\n").trim();
+            }
+            function parseAcFromText(text){
+              const lines = (text || "").split(/\r?\n/).map(s => s.trim());
+              let ac = [];
+              let cap = false;
+              for (const l of lines) {
+                if (/^acceptance\s+criteria\b/i.test(l)) { cap = true; continue; }
+                if (cap && l === "") break;
+                if (cap && l) ac.push(l.replace(/^[\-\*\[\]\(\)\s]+/, ""));
+              }
+              if (!ac.length) ac = lines.filter(l => /^[-*\[]/.test(l)).map(l => l.replace(/^[\-\*\[\]\(\)\s]+/, ""));
+              const seen = new Set(); const out = [];
+              for (const x of ac.map(x => x.replace(/\s+/g," ").trim()).filter(Boolean)) {
+                if (!seen.has(x)) { seen.add(x); out.push(x); }
+              }
+              return out;
+            }
+
+            let acMd = await acViaAzure(issue);
+            if (!acMd) {
+              const fields = issue.fields || {};
+              let text = "";
+              if (fields.description && typeof fields.description === "object" && Array.isArray(fields.description.content)) {
+                text = flattenADF(fields.description);
+              } else if (typeof fields.description === "string") {
+                text = fields.description;
+              }
+              const ac = parseAcFromText(text);
+              acMd = ac.length ? ac.map(x => "- " + x).join("\n") : "- (none found)";
+            }
+
+            // Prepare markdown for summary/artifact
+            const md = `### Jira Acceptance Criteria
+**${key || "(no key)"}**
+
+${acMd}
+`;
+            core.setOutput("key", key || "");
+            core.setOutput("markdown", md);
+
+      - name: Write to Job Summary
+        if: steps.ac.outputs.markdown != ''
+        run: |
+          echo "${{ steps.ac.outputs.markdown }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save AC as artifact
+        if: steps.ac.outputs.markdown != ''
+        run: |
+          mkdir -p out
+          printf "%s" "${{ steps.ac.outputs.markdown }}" > out/jira-ac.md
+      - uses: actions/upload-artifact@v4
+        if: steps.ac.outputs.markdown != ''
+        with:
+          name: jira-ac
+          path: out/jira-ac.md
