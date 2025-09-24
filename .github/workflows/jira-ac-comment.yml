@@ -9,63 +9,132 @@ permissions:
   pull-requests: write
 
 jobs:
-  ac_summary:
+  ac_comment:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # This step is your existing script that sets outputs.markdown
-      - name: Fetch & summarize AC (no PR comment here)
+      - name: Fetch & summarize AC
         id: ac
         env:
-          JIRA_BASE_URL:        ${{ secrets.JIRA_BASE_URL }}
-          JIRA_EMAIL:           ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_TOKEN:       ${{ secrets.JIRA_API_TOKEN }}
-          AZURE_OPENAI_ENDPOINT:   ${{ secrets.AZURE_OPENAI_ENDPOINT }}
-          AZURE_OPENAI_API_KEY:    ${{ secrets.AZURE_OPENAI_API_KEY }}
-          AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
-          AZURE_OPENAI_DEPLOYMENT:  ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
-          GITHUB_TOKEN:         ${{ secrets.GITHUB_TOKEN }}
+          JIRA_BASE_URL:              ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL:                 ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN:             ${{ secrets.JIRA_API_TOKEN }}
+          AZURE_OPENAI_ENDPOINT:      ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_KEY:       ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_API_VERSION:   ${{ secrets.AZURE_OPENAI_API_VERSION }}
+          AZURE_OPENAI_DEPLOYMENT:    ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+          GITHUB_TOKEN:               ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # (your working bash script here) 
-          # It must finish by setting the Markdown into the output:
-          #   echo "::set-output name=markdown::$MARKDOWN"
-          # In modern syntax:
-          #   echo "markdown<<EOF" >> "$GITHUB_OUTPUT"
-          #   echo "$MARKDOWN" >> "$GITHUB_OUTPUT"
-          #   echo "EOF" >> "$GITHUB_OUTPUT"
-          # For brevity, reuse what you already have that produced jira-ac.md and the summary.
+          set -euo pipefail
 
-      # Comment the markdown on the PR (upsert by marker)
-      - name: Comment AC in PR
+          EVENT_JSON="$GITHUB_EVENT_PATH"
+          TITLE=$(jq -r '.pull_request.title // ""' < "$EVENT_JSON")
+          BODY=$(jq -r '.pull_request.body // ""' < "$EVENT_JSON")
+          HEAD=$(jq -r '.pull_request.head.ref // ""' < "$EVENT_JSON")
+          BASE=$(jq -r '.pull_request.base.ref // ""' < "$EVENT_JSON")
+
+          OWNER=$(jq -r '.repository.owner.login' < "$EVENT_JSON")
+          REPO=$(jq -r '.repository.name' < "$EVENT_JSON")
+          PRNUM=$(jq -r '.pull_request.number' < "$EVENT_JSON")
+          COMMITS=$(gh api repos/$OWNER/$REPO/pulls/$PRNUM/commits --paginate --jq '.[].commit.message' || true)
+
+          LABELS=$(jq -r '.pull_request.labels[].name? // empty' < "$EVENT_JSON" | tr '\n' ' ')
+          LABEL_KEY=$(printf "%s\n" "$LABELS" | grep -oiE 'jira:[A-Za-z0-9]+-[0-9]+' | head -n1 | cut -d: -f2 || true)
+
+          HAYSTACK=$(printf "%s\n%s\n%s\n%s\n%s\n" "$TITLE" "$BODY" "$HEAD" "$BASE" "$COMMITS")
+          if [ -n "${LABEL_KEY:-}" ]; then HAYSTACK="$HAYSTACK"$'\n'"$LABEL_KEY"; fi
+          KEY=$(printf "%s" "$HAYSTACK" | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' | head -n1 | tr '[:lower:]' '[:upper:]' || true)
+
+          if [ -z "${KEY:-}" ]; then
+            MD="### Jira Acceptance Criteria\n_No Jira key found in PR title/body/branches/commits/labels._"
+            echo "markdown<<EOF" >> "$GITHUB_OUTPUT"; echo "$MD" >> "$GITHUB_OUTPUT"; echo "EOF" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Jira fetch
+          if [ -z "${JIRA_BASE_URL:-}" ] || [ -z "${JIRA_EMAIL:-}" ] || [ -z "${JIRA_API_TOKEN:-}" ]; then
+            echo "Missing JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN" >&2; exit 1
+          fi
+          AUTH=$(printf "%s:%s" "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64 | tr -d '\n')
+          ISSUE_JSON=$(curl -fsSL -H "Accept: application/json" -H "Authorization: Basic $AUTH" \
+            "${JIRA_BASE_URL%/}/rest/api/3/issue/${KEY}")
+
+          # Azure OpenAI (optional)
+          AC_MD=""
+          if [ -n "${AZURE_OPENAI_ENDPOINT:-}" ] && [ -n "${AZURE_OPENAI_API_KEY:-}" ] && [ -n "${AZURE_OPENAI_DEPLOYMENT:-}" ]; then
+            AZ_URL="${AZURE_OPENAI_ENDPOINT%/}/openai/deployments/$(printf '%s' "$AZURE_OPENAI_DEPLOYMENT" | jq -sRr @uri)/chat/completions?api-version=${AZURE_OPENAI_API_VERSION:-2024-02-15-preview}"
+            PAYLOAD=$(jq -n --arg ISSUE "$ISSUE_JSON" '
+              { temperature:0,
+                messages:[
+                  {role:"system",content:"Extract Acceptance Criteria from this Jira issue JSON. Prefer a dedicated AC custom field if present; otherwise parse the Description (Atlassian rich-text). Return ONLY Markdown bullets, one per criterion. If none, return \"- (none found)\"."},
+                  {role:"user",  content:("Issue JSON:\n"+$ISSUE)}
+                ] }')
+            set +e
+            RESP=$(curl -fsS -w "\n%{http_code}" -H "api-key: ${AZURE_OPENAI_API_KEY}" -H "Content-Type: application/json" -d "$PAYLOAD" "$AZ_URL" || true)
+            CODE=$(printf "%s" "$RESP" | tail -n1)
+            BODY_OUT=$(printf "%s" "$RESP" | sed '$d')
+            set -e
+            if [ "$CODE" = "200" ]; then
+              AC_MD=$(printf "%s" "$BODY_OUT" | jq -r '.choices[0].message.content // ""' | sed '/^[[:space:]]*$/d')
+            fi
+          fi
+
+          # Fallback parser (no AI)
+          if [ -z "$AC_MD" ]; then
+            DESC_TYPE=$(printf "%s" "$ISSUE_JSON" | jq -r '.fields.description | type? // "null"')
+            TEXT=""
+            if [ "$DESC_TYPE" = "object" ]; then
+              TEXT=$(printf "%s" "$ISSUE_JSON" | jq -r '
+                def walkdoc:
+                  if type=="object" then
+                    if .type=="text" then .text
+                    elif .type=="listItem" then "- " + ((.content // []) | map(walkdoc) | join("")) + "\n"
+                    elif .type=="paragraph" or .type=="heading" then ((.content // []) | map(walkdoc) | join("")) + "\n"
+                    else (.content // []) | map(walkdoc) | join("")
+                    end
+                  elif type=="array" then map(walkdoc) | join("")
+                  else "" end;
+                (.fields.description | walkdoc) | gsub("\n{3,}"; "\n\n") ')
+            elif [ "$DESC_TYPE" = "string" ]; then
+              TEXT=$(printf "%s" "$ISSUE_JSON" | jq -r '.fields.description')
+            fi
+            AC_MD=$(awk 'BEGIN{cap=0} tolower($0) ~ /^acceptance criteria/ {cap=1;next} cap && NF==0 {cap=0} cap && NF {print "- "$0}' <<<"$TEXT" || true)
+            if [ -z "$AC_MD" ]; then
+              AC_MD=$(printf "%s" "$TEXT" | awk '/^[ \t]*[-*]/ { sub(/^[ \t-*\[\]()]+/, "- "); print }' || true)
+            fi
+            [ -n "$AC_MD" ] || AC_MD="- (none found)"
+          fi
+
+          MD=$(printf "### Jira Acceptance Criteria\n**%s**\n\n%s\n" "$KEY" "$AC_MD")
+          # Set output for next step (commenter)
+          echo "markdown<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$MD" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Comment AC in PR (upsert)
         if: steps.ac.outputs.markdown != ''
         uses: actions/github-script@v7
         with:
           script: |
             const marker = "<!-- ac-bot-jira -->";
             const body = `${marker}\n${process.env.AC_MD}`;
-
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
             });
-
             const existing = comments.find(c => c.body && c.body.includes(marker));
             if (existing) {
               await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body
               });
             } else {
               await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body
               });
             }
         env:
