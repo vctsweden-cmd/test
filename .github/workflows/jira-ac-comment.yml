@@ -1,11 +1,11 @@
-name: Jira AC → Job Summary (Azure + fallback, no PR comment)
+name: Jira AC → Job Summary (Azure+fallback)
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited, labeled]
 
 permissions:
-  contents: read       # no "pull-requests: write" needed anymore
+  contents: read
 
 jobs:
   ac_summary:
@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch AC from Jira (Azure OpenAI + fallback)
+      - name: Fetch AC from Jira (Azure OpenAI if available)
         id: ac
         uses: actions/github-script@v7
         env:
@@ -29,17 +29,17 @@ jobs:
             const pr = context.payload.pull_request || {};
             const title = pr.title || "";
             const body  = pr.body  || "";
-            const head  = pr.head?.ref || "";
-            const base  = pr.base?.ref || "";
+            const head  = (pr.head && pr.head.ref) ? pr.head.ref : "";
+            const base  = (pr.base && pr.base.ref) ? pr.base.ref : "";
 
-            // Optional label like jira:ABC-123
+            // optional label like jira:ABC-123
             let labelKey = null;
             if (Array.isArray(pr.labels)) {
-              const hit = pr.labels.find(l => /^jira:/i.test(l.name || ""));
+              const hit = pr.labels.find(l => l && l.name && /^jira:/i.test(l.name));
               if (hit) labelKey = (hit.name.split(":")[1] || "").trim();
             }
 
-            // Also search commit messages
+            // also search commit messages
             const commits = await github.rest.pulls.listCommits({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -48,19 +48,19 @@ jobs:
             });
             const commitText = commits.data.map(c => c.commit?.message || "").join("\n");
 
-            // Find Jira key(s)
+            // find Jira keys (normalize to UPPER)
             const haystack = [title, body, head, base, labelKey, commitText].filter(Boolean).join("\n");
             const re = /\b([A-Z][A-Z0-9]+-\d+)\b/gi;
             const keys = new Set(); let m;
             while ((m = re.exec(haystack)) !== null) keys.add(m[1].toUpperCase());
-            if (!keys.size) {
-              core.setOutput("key", "");
-              core.setOutput("markdown", "_No Jira key found in PR title/body/branch/commits/labels._");
+            const key = [...keys][0] || "";
+
+            if (!key) {
+              core.setOutput("markdown", "_No Jira key found in PR title/body/branches/commits/labels._");
               return;
             }
-            const key = [...keys][0];
 
-            // Jira fetch
+            // fetch issue
             const baseUrl = process.env.JIRA_BASE_URL;
             const email   = process.env.JIRA_EMAIL;
             const token   = process.env.JIRA_API_TOKEN;
@@ -74,16 +74,20 @@ jobs:
             if (!r.ok) throw new Error("Jira fetch failed: " + r.status + " " + (await r.text()));
             const issue = await r.json();
 
-            // Azure OpenAI helper (optional)
+            // try Azure OpenAI first
             async function acViaAzure(issueJson) {
               const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
               const apiKey   = process.env.AZURE_OPENAI_API_KEY;
               const apiVer   = process.env.AZURE_OPENAI_API_VERSION || "2024-02-15-preview";
               const dep      = process.env.AZURE_OPENAI_DEPLOYMENT;
               if (!endpoint || !apiKey || !dep) return null;
-              const azureUrl = endpoint.replace(/\/+$/,"") + "/openai/deployments/" + encodeURIComponent(dep) + "/chat/completions?api-version=" + encodeURIComponent(apiVer);
+
+              const azureUrl = endpoint.replace(/\/+$/,"")
+                + "/openai/deployments/" + encodeURIComponent(dep)
+                + "/chat/completions?api-version=" + encodeURIComponent(apiVer);
+
               const messages = [
-                { role: "system", content: "Extract Acceptance Criteria from this Jira issue JSON. Prefer a dedicated AC custom field if present; otherwise parse the Description (Atlassian rich-text). Return ONLY Markdown bullets, one per criterion. If none, return '- (none found)'." },
+                { role: "system", content: "Extract Acceptance Criteria from this Jira issue JSON. Prefer a dedicated AC field if present; else parse Description (Atlassian rich-text). Return ONLY Markdown bullets, one per criterion. If none, return '- (none found)'." },
                 { role: "user", content: "Issue JSON:\n" + JSON.stringify(issueJson) }
               ];
               const resp = await fetch(azureUrl, {
@@ -91,12 +95,12 @@ jobs:
                 headers: { "api-key": apiKey, "Content-Type": "application/json" },
                 body: JSON.stringify({ temperature: 0, messages })
               });
-              if (!resp.ok) { core.warning("Azure OpenAI error " + resp.status + ": " + (await resp.text())); return null; }
+              if (!resp.ok) { core.warning("Azure OpenAI " + resp.status + ": " + (await resp.text())); return null; }
               const data = await resp.json();
-              return (data?.choices?.[0]?.message?.content || "").trim();
+              return (data?.choices?.[0]?.message?.content || "").trim() || null;
             }
 
-            // Fallback parser (no AI)
+            // fallback parser (no AI)
             function flattenADF(doc){
               if (!doc || typeof doc !== "object") return "";
               function walk(n){
@@ -139,27 +143,13 @@ jobs:
               acMd = ac.length ? ac.map(x => "- " + x).join("\n") : "- (none found)";
             }
 
-            // Prepare markdown for summary/artifact
-            const md = `### Jira Acceptance Criteria
-**${key || "(no key)"}**
+            const markdown = `### Jira Acceptance Criteria
+**${key}**
 
 ${acMd}
 `;
-            core.setOutput("key", key || "");
-            core.setOutput("markdown", md);
+            core.setOutput("markdown", markdown)
 
       - name: Write to Job Summary
         if: steps.ac.outputs.markdown != ''
-        run: |
-          echo "${{ steps.ac.outputs.markdown }}" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Save AC as artifact
-        if: steps.ac.outputs.markdown != ''
-        run: |
-          mkdir -p out
-          printf "%s" "${{ steps.ac.outputs.markdown }}" > out/jira-ac.md
-      - uses: actions/upload-artifact@v4
-        if: steps.ac.outputs.markdown != ''
-        with:
-          name: jira-ac
-          path: out/jira-ac.md
+        run: echo "${{ steps.ac.outputs.markdown }}" >> "$GITHUB_STEP_SUMMARY"
