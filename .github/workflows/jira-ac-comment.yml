@@ -1,4 +1,4 @@
-name: Jira AC → PR comment (Azure+fallback)
+name: Jira AC → PR comment + AI check (Azure+fallback)
 
 on:
   pull_request:
@@ -9,12 +9,13 @@ permissions:
   pull-requests: write
 
 jobs:
-  ac_comment:
+  ac_and_check:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ---- 1) Fetch AC from Jira (Azure OpenAI if available, else parser) ----
       - name: Fetch & summarize AC
         id: ac
         env:
@@ -50,6 +51,8 @@ jobs:
           if [ -z "${KEY:-}" ]; then
             MD="### Jira Acceptance Criteria\n_No Jira key found in PR title/body/branches/commits/labels._"
             echo "markdown<<EOF" >> "$GITHUB_OUTPUT"; echo "$MD" >> "$GITHUB_OUTPUT"; echo "EOF" >> "$GITHUB_OUTPUT"
+            echo "key=" >> "$GITHUB_OUTPUT"
+            echo "bullets_json=[]" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -108,12 +111,15 @@ jobs:
           fi
 
           MD=$(printf "### Jira Acceptance Criteria\n**%s**\n\n%s\n" "$KEY" "$AC_MD")
-          # Set output for next step (commenter)
-          echo "markdown<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$MD" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
 
-      - name: Comment AC in PR (upsert)
+          # Outputs for later steps
+          echo "markdown<<EOF" >> "$GITHUB_OUTPUT"; echo "$MD" >> "$GITHUB_OUTPUT"; echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+          BULLETS_JSON=$(printf "%s" "$AC_MD" | sed 's/^[[:space:]]*[-*•][[:space:]]*//' | jq -R -s 'split("\n")|map(select(length>0))')
+          echo "bullets_json=$BULLETS_JSON" >> "$GITHUB_OUTPUT"
+
+      # ---- 2) Comment the AC on the PR (upsert) ----
+      - name: Comment AC in PR
         if: steps.ac.outputs.markdown != ''
         uses: actions/github-script@v7
         with:
@@ -121,21 +127,124 @@ jobs:
             const marker = "<!-- ac-bot-jira -->";
             const body = `${marker}\n${process.env.AC_MD}`;
             const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number,
             });
             const existing = comments.find(c => c.body && c.body.includes(marker));
             if (existing) {
               await github.rest.issues.updateComment({
-                owner: context.repo.owner, repo: context.repo.repo,
-                comment_id: existing.id, body
+                owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body
               });
             } else {
               await github.rest.issues.createComment({
-                owner: context.repo.owner, repo: context.repo.repo,
-                issue_number: context.issue.number, body
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body
               });
             }
         env:
           AC_MD: ${{ steps.ac.outputs.markdown }}
+
+      # ---- 3) Build a compact PR diff (for AI to analyze) ----
+      - name: Build PR diff
+        id: diff
+        run: |
+          set -euo pipefail
+          git fetch origin "${{ github.base_ref }}" --depth=1 || true
+          git fetch origin "${{ github.head_ref }}" --depth=1 || true
+          git diff --unified=0 --no-color origin/${{ github.base_ref }}...origin/${{ github.head_ref }} \
+            | head -c 180000 > pr.diff
+          echo "DIFF<<EOF" >> "$GITHUB_OUTPUT"; cat pr.diff >> "$GITHUB_OUTPUT"; echo "EOF" >> "$GITHUB_OUTPUT"
+
+      # ---- 4) Ask Azure OpenAI to evaluate AC vs diff and comment results ----
+      - name: AC vs Code – Azure AI and comment
+        id: eval
+        if: steps.ac.outputs.bullets_json != '' && steps.diff.outputs.DIFF != ''
+        uses: actions/github-script@v7
+        env:
+          AC_ARRAY_JSON:             ${{ steps.ac.outputs.bullets_json }}
+          DIFF:                      ${{ steps.diff.outputs.DIFF }}
+          AZURE_OPENAI_ENDPOINT:     ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_KEY:      ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_API_VERSION:  ${{ secrets.AZURE_OPENAI_API_VERSION }}
+          AZURE_OPENAI_DEPLOYMENT:   ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+        with:
+          script: |
+            const marker = "<!-- ac-azure-compare -->";
+            const ac = JSON.parse(process.env.AC_ARRAY_JSON || "[]");
+            const diff = process.env.DIFF || "(no diff)";
+            async function post(body){
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number
+              });
+              const existing = comments.find(c => c.body?.includes(marker));
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body
+                });
+              }
+            }
+            async function callAzure(){
+              const ep  = process.env.AZURE_OPENAI_ENDPOINT;
+              const key = process.env.AZURE_OPENAI_API_KEY;
+              const ver = process.env.AZURE_OPENAI_API_VERSION || "2024-02-15-preview";
+              const dep = process.env.AZURE_OPENAI_DEPLOYMENT;
+              if (!ep || !key || !dep) return null;
+              const url = `${ep.replace(/\/+$/,"")}/openai/deployments/${encodeURIComponent(dep)}/chat/completions?api-version=${encodeURIComponent(ver)}`;
+              const resp = await fetch(url, {
+                method: "POST",
+                headers: { "api-key": key, "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  temperature: 0,
+                  response_format: { type: "json_object" },
+                  messages: [
+                    { role: "system", content:
+                      "You are a senior C# reviewer. For EACH acceptance criterion, read the unified diff and decide: satisfied | not_satisfied | unknown. Be conservative. Return STRICT JSON: {summary, results:[{criterion, status, confidence, evidence, suggested_tests}]}. Evidence should quote file:line snippets found in the diff." },
+                    { role: "user", content:
+                      "Acceptance Criteria:\n" + JSON.stringify(ac, null, 2) + "\n\nUnified diff:\n" + diff }
+                  ]
+                })
+              });
+              if (!resp.ok) return null;
+              const data = await resp.json();
+              try { return JSON.parse(data.choices[0].message.content); }
+              catch { return null; }
+            }
+
+            const out = await callAzure();
+            if (!out || !Array.isArray(out.results)) {
+              await post(`${marker}\n### AC vs Code – AI Check\n_Azure evaluation unavailable. Showing diff size:_ ${diff.length} chars`);
+              core.setOutput("fail", "false");
+              return;
+            }
+
+            function emoji(s){ return {satisfied:"✅", not_satisfied:"❌", unknown:"⚠️"}[s] || "⚠️"; }
+            let md = `${marker}
+### Acceptance Criteria – AI Check
+Diff analyzed: ${diff.length} chars
+
+| Criterion | Status | Confidence |
+|---|---|---|
+`;
+            let anyFail = false;
+            for (const r of out.results) {
+              if (r.status === "not_satisfied") anyFail = true;
+              md += `| ${String(r.criterion).replace(/\|/g,"\\|")} | ${emoji(r.status)} ${r.status} | ${(Number(r.confidence)||0).toFixed(2)} |\n`;
+            }
+            if (out.summary) md += `\n**Summary:** ${out.summary}\n`;
+            md += `\n**Notes & Evidence**\n`;
+            for (const r of out.results) {
+              const ev = Array.isArray(r.evidence) ? r.evidence.slice(0,5).join("; ") : "—";
+              const tests = Array.isArray(r.suggested_tests) ? r.suggested_tests.slice(0,3).join("; ") : "—";
+              md += `- \`${r.criterion}\` → ${emoji(r.status)} **${r.status}** · Evidence: ${ev} · Suggested tests: ${tests}\n`;
+            }
+            await post(md);
+            core.setOutput("fail", anyFail ? "true" : "false");
+
+      # ---- 5) (Optional) Fail the job if any criterion failed ----
+      - name: Fail if AC not satisfied
+        if: steps.eval.outputs.fail == 'true'
+        run: |
+          echo "One or more acceptance criteria were NOT satisfied." >&2
+          exit 1
