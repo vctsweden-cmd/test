@@ -1,94 +1,19 @@
-# PR-Agent configuration focused on enforcing Jira Acceptance Criteria (AC)
-# Make the PR fail unless all AC are satisfied.
+name: PR-Agent Review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
 
-# --- Core behavior -----------------------------------------------------------
-pre_merge_checks:
-  custom_checks:
-    - name: "Acceptance Criteria check"
-      mode: error          # error => fail the PR status check if unmet
-      instructions: |
-        1) Locate the Acceptance Criteria for this PR:
-           - Prefer an "Acceptance Criteria" section in the PR body (Markdown list or checklist).
-           - Otherwise, use the latest PR comment posted by Jira Automation, Rovo, or a bot that contains the issue key
-             and an "Acceptance Criteria" block.
-        2) Treat each bullet / checklist item or Given-When-Then block as an individual criterion.
-        3) Evaluate the code diff and existing/added tests against each criterion:
-           - Mark ✅ when the code clearly implements the item and there is test coverage (unit/integration/e2e).
-           - Mark ❌ if not implemented, unclear, or missing tests.
-        4) Pass this check ONLY if every criterion is ✅.
-        5) Output a short report:
-           - A Markdown checklist with ✅/❌ per item.
-           - Evidence (files/lines/tests) for each ✅.
-           - Exact follow-ups for each ❌.
-
-# --- Review prompts (used by PR-Agent when commenting) -----------------------
-review:
-  system_message: |
-    You are a senior reviewer. Prioritize Acceptance Criteria compliance and test coverage.
-    If criteria are ambiguous, call it out and mark as ❌.
-  max_review_comments: 30
-  summarize_changes: true
-
-# --- How to find AC text (heuristics the agent uses) -------------------------
-acceptance_criteria:
-  section_titles:
-    - "Acceptance Criteria"
-    - "AC"
-    - "Definition of Done"
-    - "Business Requirements"
-  # If your Jira posts AC as a comment, match by these hints (any):
-  comment_hints:
-    - "Acceptance Criteria (from Jira"
-    - "Acceptance Criteria for"
-    - "Jira issue"
-  # If your team uses checklists, require all checked:
-  require_all_checked: true
-
-# --- Triggers / controls -----------------------------------------------------
-triggers:
-  on_pr_open: true
-  on_pr_synchronize: true
-  on_pr_reopen: true
-  on_label_added: [ "re-run-ai-review" ]   # optional manual re-run label
-
-# Skip running on trivial or generated changes
-skip:
-  if_changed_only:
-    - "**/*.md"
-    - "**/*.svg"
-    - "**/*.png"
-    - "**/*.jpg"
-    - "**/dist/**"
-    - "**/build/**"
-    - "**/vendor/**"
-
-# --- Large diffs handling ----------------------------------------------------
-limits:
-  max_changed_files: 250
-  max_total_diff_lines: 6000
-  # If exceeded, still run the AC check but focus on high-signal files (tests/src)
-  focus_globs:
-    - "src/**"
-    - "app/**"
-    - "server/**"
-    - "api/**"
-    - "tests/**"
-    - "spec/**"
-    - "e2e/**"
-    - "**/*.feature"
-
-# --- Output style ------------------------------------------------------------
-output:
-  checklist_header: "### Acceptance Criteria result"
-  show_file_evidence: true
-  require_test_evidence: true
-  fail_message: |
-    ❌ Some Acceptance Criteria are not satisfied. Please address the ❌ items or add tests.
-  pass_message: |
-    ✅ All Acceptance Criteria are satisfied with adequate test coverage.
-
-# --- Optional: org/team conventions to enforce alongside AC ------------------
-policy:
-  require_issue_key_in_title: true
-  title_prefixes: [ "feat:", "fix:", "chore:", "refactor:", "docs:" ]
-  require_pr_description: true
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run PR-Agent review
+        uses: codium-ai/pr-agent@main
+        env:
+          OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
