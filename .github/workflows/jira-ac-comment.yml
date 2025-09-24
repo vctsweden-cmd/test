@@ -1,4 +1,4 @@
-name: Jira AC → PR comment (Azure OpenAI)
+name: Jira AC → PR comment (Azure + fallback)
 
 on:
   pull_request:
@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Post AC from Jira (Azure OpenAI with fallback)
+      - name: Post AC from Jira
         uses: actions/github-script@v7
         env:
           JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
@@ -28,149 +28,4 @@ jobs:
           script: |
             const marker = "<!-- ac-azure-jira -->";
 
-            // ---- Collect a Jira key from title/body/branches/commits/label jira:KEY ----
-            const pr = context.payload.pull_request || {};
-            const title = pr.title || "";
-            const body  = pr.body  || "";
-            const head  = pr.head?.ref || "";
-            const base  = pr.base?.ref || "";
-
-            // label override like "jira:H2-1"
-            let labelKey = null;
-            if (Array.isArray(pr.labels)) {
-              const hit = pr.labels.find(l => /^jira:/i.test(l.name || ""));
-              if (hit) labelKey = (hit.name.split(":")[1] || "").trim();
-            }
-
-            const commits = await github.rest.pulls.listCommits({
-              owner: context.repo.owner, repo: context.repo.repo,
-              pull_number: context.issue.number, per_page: 250
-            });
-            const commitText = commits.data.map(c => c.commit?.message || "").join("\n");
-
-            const haystack = [title, body, head, base, commitText, labelKey].filter(Boolean).join("\n");
-            const re = /\b([A-Z][A-Z0-9]+-\d+)\b/gi;
-            const keys = new Set(); let m;
-            while ((m = re.exec(haystack)) !== null) keys.add(m[1].toUpperCase());
-
-            if (!keys.size) {
-              const msg = `${marker}
-_No Jira key found in PR title/body/branch/commits/labels._
-Tip: add label \`jira:ABC-123\` or include the key in the title.`;
-              const { data: comments } = await github.rest.issues.listComments({
-                owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number
-              });
-              const existing = comments.find(c => c.body?.includes(marker));
-              if (existing) await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body: msg });
-              else await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body: msg });
-              return;
-            }
-            const key = [...keys][0];
-
-            // ---- Jira fetch ----
-            const baseUrl = process.env.JIRA_BASE_URL;
-            const email   = process.env.JIRA_EMAIL;
-            const token   = process.env.JIRA_API_TOKEN;
-            if (!baseUrl || !email || !token) {
-              core.setFailed("Missing one of: JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN");
-              return;
-            }
-            const auth = "Basic " + Buffer.from(email + ":" + token).toString("base64");
-            const url  = baseUrl.replace(/\/+$/,"") + "/rest/api/3/issue/" + encodeURIComponent(key);
-            const r = await fetch(url, { headers: { "Accept":"application/json", "Authorization": auth } });
-            if (!r.ok) throw new Error("Jira fetch failed: " + r.status + " " + (await r.text()));
-            const issue = await r.json();
-
-            // ---- Azure OpenAI call (chat.completions) ----
-            async function acViaAzureOpenAI(issueJson) {
-              const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
-              const apiKey   = process.env.AZURE_OPENAI_API_KEY;
-              const apiVer   = process.env.AZURE_OPENAI_API_VERSION || "2024-02-15-preview";
-              const dep      = process.env.AZURE_OPENAI_DEPLOYMENT;
-              if (!endpoint || !apiKey || !dep) return null; // no Azure secrets: let fallback run
-
-              const azureUrl = endpoint.replace(/\/+$/,"") +
-                "/openai/deployments/" + encodeURIComponent(dep) +
-                "/chat/completions?api-version=" + encodeURIComponent(apiVer);
-
-              const messages = [
-                { role: "system", content:
-                  "Extract Acceptance Criteria from this Jira issue JSON. Prefer a dedicated AC custom field if present; otherwise parse the Description (Atlassian rich-text). Return ONLY Markdown bullets, one per criterion. If none, return '- (none found)'." },
-                { role: "user", content: "Issue JSON:\n" + JSON.stringify(issueJson) }
-              ];
-
-              const resp = await fetch(azureUrl, {
-                method: "POST",
-                headers: { "api-key": apiKey, "Content-Type": "application/json" },
-                body: JSON.stringify({ temperature: 0, messages })
-              });
-              if (!resp.ok) {
-                const txt = await resp.text();
-                core.warning(`Azure OpenAI error ${resp.status}: ${txt}`);
-                return null;
-              }
-              const data = await resp.json();
-              return (data.choices?.[0]?.message?.content || "").trim();
-            }
-
-            // ---- No-AI fallback parser (ADF → text, then bullets) ----
-            function flattenADF(doc){
-              if (!doc || typeof doc !== "object") return "";
-              function walk(n){
-                if (!n) return "";
-                if (n.type === "text") return n.text || "";
-                const parts = (n.content || []).map(walk).join("");
-                if (["paragraph","heading"].includes(n.type)) return parts + "\n";
-                if (n.type === "listItem") return "- " + parts + "\n";
-                if (["bulletList","orderedList"].includes(n.type)) return parts;
-                return parts;
-              }
-              return walk(doc).replace(/\n{3,}/g, "\n\n").trim();
-            }
-            function parseAcFromText(text){
-              const lines = (text || "").split(/\r?\n/).map(l => l.trim());
-              let ac = [];
-              let cap = false;
-              for (const l of lines) {
-                if (/^acceptance\s+criteria\b/i.test(l)) { cap = true; continue; }
-                if (cap && l === "") break;
-                if (cap && l) ac.push(l.replace(/^[\-\*\[\]\(\)\s]+/,""));
-              }
-              if (!ac.length) ac = lines.filter(l => /^[-*\[]/.test(l)).map(l => l.replace(/^[\-\*\[\]\(\)\s]+/,""));
-              // dedupe
-              const seen = new Set(); const out = [];
-              for (const x of ac.map(x => x.replace(/\s+/g," ").trim()).filter(Boolean)) {
-                if (!seen.has(x)) { seen.add(x); out.push(x); }
-              }
-              return out;
-            }
-
-            let acListMd = await acViaAzureOpenAI(issue);
-            if (!acListMd) {
-              const fields = issue.fields || {};
-              let text = "";
-              if (fields.description && typeof fields.description === "object" && Array.isArray(fields.description.content)) {
-                text = flattenADF(fields.description);
-              } else if (typeof fields.description === "string") {
-                text = fields.description;
-              }
-              const ac = parseAcFromText(text);
-              acListMd = ac.length ? ac.map(x => "- " + x).join("\n") : "- (none found)";
-            }
-
-            // ---- Upsert PR comment ----
-            const bodyMd = `${marker}
-### Jira Acceptance Criteria
-**${key}**
-
-${acListMd}
-`;
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number
-            });
-            const existing = comments.find(c => c.body?.includes(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body: bodyMd });
-            } else {
-              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body: bodyMd });
-            }
+            // --- Find a Jira key in title/body/branches/commits or label "jira:KEY" ---
