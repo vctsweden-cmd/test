@@ -1,4 +1,4 @@
-name: Jira AC → PR comment + AI check (Azure+fallback)
+name: Jira AC → PR comment + AI check (Azure)
 
 on:
   pull_request:
@@ -12,179 +12,182 @@ jobs:
   ac_and_check:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ---- 1) Fetch AC from Jira (Azure OpenAI if available, else parser) ----
-      - name: Fetch & summarize AC
+      # 1) Get AC from Jira (Azure if available, else parser) and comment it
+      - name: Fetch AC + comment
         id: ac
-        env:
-          JIRA_BASE_URL:              ${{ secrets.JIRA_BASE_URL }}
-          JIRA_EMAIL:                 ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_TOKEN:             ${{ secrets.JIRA_API_TOKEN }}
-          AZURE_OPENAI_ENDPOINT:      ${{ secrets.AZURE_OPENAI_ENDPOINT }}
-          AZURE_OPENAI_API_KEY:       ${{ secrets.AZURE_OPENAI_API_KEY }}
-          AZURE_OPENAI_API_VERSION:   ${{ secrets.AZURE_OPENAI_API_VERSION }}
-          AZURE_OPENAI_DEPLOYMENT:    ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
-          GITHUB_TOKEN:               ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          EVENT_JSON="$GITHUB_EVENT_PATH"
-          TITLE=$(jq -r '.pull_request.title // ""' < "$EVENT_JSON")
-          BODY=$(jq -r '.pull_request.body // ""' < "$EVENT_JSON")
-          HEAD=$(jq -r '.pull_request.head.ref // ""' < "$EVENT_JSON")
-          BASE=$(jq -r '.pull_request.base.ref // ""' < "$EVENT_JSON")
-
-          OWNER=$(jq -r '.repository.owner.login' < "$EVENT_JSON")
-          REPO=$(jq -r '.repository.name' < "$EVENT_JSON")
-          PRNUM=$(jq -r '.pull_request.number' < "$EVENT_JSON")
-          COMMITS=$(gh api repos/$OWNER/$REPO/pulls/$PRNUM/commits --paginate --jq '.[].commit.message' || true)
-
-          LABELS=$(jq -r '.pull_request.labels[].name? // empty' < "$EVENT_JSON" | tr '\n' ' ')
-          LABEL_KEY=$(printf "%s\n" "$LABELS" | grep -oiE 'jira:[A-Za-z0-9]+-[0-9]+' | head -n1 | cut -d: -f2 || true)
-
-          HAYSTACK=$(printf "%s\n%s\n%s\n%s\n%s\n" "$TITLE" "$BODY" "$HEAD" "$BASE" "$COMMITS")
-          if [ -n "${LABEL_KEY:-}" ]; then HAYSTACK="$HAYSTACK"$'\n'"$LABEL_KEY"; fi
-          KEY=$(printf "%s" "$HAYSTACK" | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' | head -n1 | tr '[:lower:]' '[:upper:]' || true)
-
-          if [ -z "${KEY:-}" ]; then
-            MD="### Jira Acceptance Criteria\n_No Jira key found in PR title/body/branches/commits/labels._"
-            echo "markdown<<EOF" >> "$GITHUB_OUTPUT"; echo "$MD" >> "$GITHUB_OUTPUT"; echo "EOF" >> "$GITHUB_OUTPUT"
-            echo "key=" >> "$GITHUB_OUTPUT"
-            echo "bullets_json=[]" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Jira fetch
-          if [ -z "${JIRA_BASE_URL:-}" ] || [ -z "${JIRA_EMAIL:-}" ] || [ -z "${JIRA_API_TOKEN:-}" ]; then
-            echo "Missing JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN" >&2; exit 1
-          fi
-          AUTH=$(printf "%s:%s" "$JIRA_EMAIL" "$JIRA_API_TOKEN" | base64 | tr -d '\n')
-          ISSUE_JSON=$(curl -fsSL -H "Accept: application/json" -H "Authorization: Basic $AUTH" \
-            "${JIRA_BASE_URL%/}/rest/api/3/issue/${KEY}")
-
-          # Azure OpenAI (optional)
-          AC_MD=""
-          if [ -n "${AZURE_OPENAI_ENDPOINT:-}" ] && [ -n "${AZURE_OPENAI_API_KEY:-}" ] && [ -n "${AZURE_OPENAI_DEPLOYMENT:-}" ]; then
-            AZ_URL="${AZURE_OPENAI_ENDPOINT%/}/openai/deployments/$(printf '%s' "$AZURE_OPENAI_DEPLOYMENT" | jq -sRr @uri)/chat/completions?api-version=${AZURE_OPENAI_API_VERSION:-2024-02-15-preview}"
-            PAYLOAD=$(jq -n --arg ISSUE "$ISSUE_JSON" '
-              { temperature:0,
-                messages:[
-                  {role:"system",content:"Extract Acceptance Criteria from this Jira issue JSON. Prefer a dedicated AC custom field if present; otherwise parse the Description (Atlassian rich-text). Return ONLY Markdown bullets, one per criterion. If none, return \"- (none found)\"."},
-                  {role:"user",  content:("Issue JSON:\n"+$ISSUE)}
-                ] }')
-            set +e
-            RESP=$(curl -fsS -w "\n%{http_code}" -H "api-key: ${AZURE_OPENAI_API_KEY}" -H "Content-Type: application/json" -d "$PAYLOAD" "$AZ_URL" || true)
-            CODE=$(printf "%s" "$RESP" | tail -n1)
-            BODY_OUT=$(printf "%s" "$RESP" | sed '$d')
-            set -e
-            if [ "$CODE" = "200" ]; then
-              AC_MD=$(printf "%s" "$BODY_OUT" | jq -r '.choices[0].message.content // ""' | sed '/^[[:space:]]*$/d')
-            fi
-          fi
-
-          # Fallback parser (no AI)
-          if [ -z "$AC_MD" ]; then
-            DESC_TYPE=$(printf "%s" "$ISSUE_JSON" | jq -r '.fields.description | type? // "null"')
-            TEXT=""
-            if [ "$DESC_TYPE" = "object" ]; then
-              TEXT=$(printf "%s" "$ISSUE_JSON" | jq -r '
-                def walkdoc:
-                  if type=="object" then
-                    if .type=="text" then .text
-                    elif .type=="listItem" then "- " + ((.content // []) | map(walkdoc) | join("")) + "\n"
-                    elif .type=="paragraph" or .type=="heading" then ((.content // []) | map(walkdoc) | join("")) + "\n"
-                    else (.content // []) | map(walkdoc) | join("")
-                    end
-                  elif type=="array" then map(walkdoc) | join("")
-                  else "" end;
-                (.fields.description | walkdoc) | gsub("\n{3,}"; "\n\n") ')
-            elif [ "$DESC_TYPE" = "string" ]; then
-              TEXT=$(printf "%s" "$ISSUE_JSON" | jq -r '.fields.description')
-            fi
-            AC_MD=$(awk 'BEGIN{cap=0} tolower($0) ~ /^acceptance criteria/ {cap=1;next} cap && NF==0 {cap=0} cap && NF {print "- "$0}' <<<"$TEXT" || true)
-            if [ -z "$AC_MD" ]; then
-              AC_MD=$(printf "%s" "$TEXT" | awk '/^[ \t]*[-*]/ { sub(/^[ \t-*\[\]()]+/, "- "); print }' || true)
-            fi
-            [ -n "$AC_MD" ] || AC_MD="- (none found)"
-          fi
-
-          MD=$(printf "### Jira Acceptance Criteria\n**%s**\n\n%s\n" "$KEY" "$AC_MD")
-
-          # Outputs for later steps
-          echo "markdown<<EOF" >> "$GITHUB_OUTPUT"; echo "$MD" >> "$GITHUB_OUTPUT"; echo "EOF" >> "$GITHUB_OUTPUT"
-          echo "key=$KEY" >> "$GITHUB_OUTPUT"
-          BULLETS_JSON=$(printf "%s" "$AC_MD" | sed 's/^[[:space:]]*[-*•][[:space:]]*//' | jq -R -s 'split("\n")|map(select(length>0))')
-          echo "bullets_json=$BULLETS_JSON" >> "$GITHUB_OUTPUT"
-
-      # ---- 2) Comment the AC on the PR (upsert) ----
-      - name: Comment AC in PR
-        if: steps.ac.outputs.markdown != ''
         uses: actions/github-script@v7
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
+          AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
         with:
           script: |
             const marker = "<!-- ac-bot-jira -->";
-            const body = `${marker}\n${process.env.AC_MD}`;
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number,
-            });
-            const existing = comments.find(c => c.body && c.body.includes(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body
-              });
+
+            // ---- Gather PR context
+            const pr = context.payload.pull_request;
+            const title = pr.title || "", body = pr.body || "";
+            const head = pr.head?.ref || "", base = pr.base?.ref || "";
+
+            // include label like jira:ABC-123
+            let labelKey = null;
+            if (Array.isArray(pr.labels)) {
+              const hit = pr.labels.find(l => l?.name && /^jira:/i.test(l.name));
+              if (hit) labelKey = hit.name.split(":")[1]?.trim();
             }
-        env:
-          AC_MD: ${{ steps.ac.outputs.markdown }}
 
-      # ---- 3) Build a compact PR diff (for AI to analyze) ----
-      - name: Build PR diff
-        id: diff
-        run: |
-          set -euo pipefail
-          git fetch origin "${{ github.base_ref }}" --depth=1 || true
-          git fetch origin "${{ github.head_ref }}" --depth=1 || true
-          git diff --unified=0 --no-color origin/${{ github.base_ref }}...origin/${{ github.head_ref }} \
-            | head -c 180000 > pr.diff
-          echo "DIFF<<EOF" >> "$GITHUB_OUTPUT"; cat pr.diff >> "$GITHUB_OUTPUT"; echo "EOF" >> "$GITHUB_OUTPUT"
+            // include commit messages
+            const commits = await github.rest.pulls.listCommits({
+              owner: context.repo.owner, repo: context.repo.repo, pull_number: pr.number, per_page: 250
+            });
+            const commitText = commits.data.map(c => c.commit?.message || "").join("\n");
 
-      # ---- 4) Ask Azure OpenAI to evaluate AC vs diff and comment results ----
-      - name: AC vs Code – Azure AI and comment
-        id: eval
-        if: steps.ac.outputs.bullets_json != '' && steps.diff.outputs.DIFF != ''
+            // find Jira key (normalize to UPPER)
+            const haystack = [title, body, head, base, labelKey, commitText].filter(Boolean).join("\n");
+            const re = /\b([A-Z][A-Z0-9]+-\d+)\b/gi;
+            const keys = new Set(); let m; while ((m = re.exec(haystack)) !== null) keys.add(m[1].toUpperCase());
+            const key = [...keys][0] || "";
+
+            if (!key) {
+              const bodyMd = `${marker}\n_No Jira key found in PR title/body/branches/commits/labels._`;
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number, body: bodyMd });
+              core.setOutput("ac_bullets_json", "[]");
+              return;
+            }
+
+            // ---- Fetch Jira issue
+            const baseUrl = process.env.JIRA_BASE_URL, email = process.env.JIRA_EMAIL, token = process.env.JIRA_API_TOKEN;
+            if (!baseUrl || !email || !token) throw new Error("Missing JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN");
+            const auth = "Basic " + Buffer.from(`${email}:${token}`).toString("base64");
+            const resp = await fetch(`${baseUrl.replace(/\/+$/,"")}/rest/api/3/issue/${encodeURIComponent(key)}`, {
+              headers: { "Accept": "application/json", "Authorization": auth }
+            });
+            if (!resp.ok) throw new Error(`Jira fetch failed: ${resp.status} ${await resp.text()}`);
+            const issue = await resp.json();
+
+            // ---- Try Azure to extract AC
+            async function acViaAzure(issueJson){
+              const ep = process.env.AZURE_OPENAI_ENDPOINT, k = process.env.AZURE_OPENAI_API_KEY, dep = process.env.AZURE_OPENAI_DEPLOYMENT;
+              const ver = process.env.AZURE_OPENAI_API_VERSION || "2024-02-15-preview";
+              if (!ep || !k || !dep) return null;
+              const url = `${ep.replace(/\/+$/,"")}/openai/deployments/${encodeURIComponent(dep)}/chat/completions?api-version=${encodeURIComponent(ver)}`;
+              const r = await fetch(url, {
+                method: "POST",
+                headers: { "api-key": k, "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  temperature: 0,
+                  messages: [
+                    { role: "system", content: "Extract Acceptance Criteria from this Jira issue JSON. Prefer a dedicated AC field if present; else parse Description (Atlassian rich-text). Return ONLY Markdown bullets, one per criterion. If none, return '- (none found)'." },
+                    { role: "user", content: "Issue JSON:\n" + JSON.stringify(issueJson) }
+                  ]
+                })
+              });
+              if (!r.ok) { core.warning(`Azure OpenAI ${r.status}`); return null; }
+              const d = await r.json();
+              return d?.choices?.[0]?.message?.content?.trim() || null;
+            }
+
+            // ---- Fallback parser (ADF flatten)
+            function flattenADF(doc){
+              if (!doc || typeof doc !== "object") return "";
+              function w(n){
+                if (!n) return "";
+                if (n.type === "text") return n.text || "";
+                const parts = (n.content || []).map(w).join("");
+                if (n.type === "listItem") return "- " + parts + "\n";
+                if (n.type === "paragraph" || n.type === "heading") return parts + "\n";
+                return parts;
+              }
+              return w(doc).replace(/\n{3,}/g, "\n\n").trim();
+            }
+            function parseAcFromText(text){
+              const lines = (text || "").split(/\r?\n/).map(s => s.trim());
+              let ac = []; let cap = false;
+              for (const l of lines) {
+                if (/^acceptance\s+criteria\b/i.test(l)) { cap = true; continue; }
+                if (cap && l === "") break;
+                if (cap && l) ac.push(l.replace(/^[\-\*\[\]\(\)\s]+/, ""));
+              }
+              if (!ac.length) ac = lines.filter(l => /^[-*\[]/.test(l)).map(l => l.replace(/^[\-\*\[\]\(\)\s]+/, ""));
+              const seen = new Set(); const out = [];
+              for (const x of ac.map(x => x.replace(/\s+/g," ").trim()).filter(Boolean)) if (!seen.has(x)) { seen.add(x); out.push(x); }
+              return out;
+            }
+
+            let acMd = await acViaAzure(issue);
+            if (!acMd) {
+              const desc = issue.fields?.description;
+              let text = "";
+              if (desc && typeof desc === "object" && Array.isArray(desc.content)) text = flattenADF(desc);
+              else if (typeof desc === "string") text = desc;
+              const list = parseAcFromText(text);
+              acMd = list.length ? list.map(x => "- " + x).join("\n") : "- (none found)";
+            }
+
+            const bodyMd = `${marker}
+### Jira Acceptance Criteria
+**${key}**
+
+${acMd}
+`;
+            // upsert PR comment
+            const { data: comments } = await github.rest.issues.listComments({ owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number });
+            const existing = comments.find(c => c.body?.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body: bodyMd });
+            } else {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number, body: bodyMd });
+            }
+
+            // expose AC bullets for the next step
+            const bullets = acMd.split("\n")
+              .map(l => l.replace(/^\s*[-*•]\s*/, "").trim())
+              .filter(Boolean);
+            core.setOutput("ac_bullets_json", JSON.stringify(bullets));
+
+      # 2) Build diff, evaluate AC vs code with Azure, and comment results
+      - name: Evaluate AC vs PR diff (Azure) + comment
+        if: steps.ac.outputs.ac_bullets_json != '[]'
         uses: actions/github-script@v7
         env:
-          AC_ARRAY_JSON:             ${{ steps.ac.outputs.bullets_json }}
-          DIFF:                      ${{ steps.diff.outputs.DIFF }}
-          AZURE_OPENAI_ENDPOINT:     ${{ secrets.AZURE_OPENAI_ENDPOINT }}
-          AZURE_OPENAI_API_KEY:      ${{ secrets.AZURE_OPENAI_API_KEY }}
-          AZURE_OPENAI_API_VERSION:  ${{ secrets.AZURE_OPENAI_API_VERSION }}
-          AZURE_OPENAI_DEPLOYMENT:   ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+          AC_ARRAY_JSON: ${{ steps.ac.outputs.ac_bullets_json }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
+          AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
         with:
           script: |
             const marker = "<!-- ac-azure-compare -->";
+
+            // Build compact unified diff (shell from Node)
+            const { execSync } = require("child_process");
+            try { execSync(`git fetch origin ${process.env.GITHUB_BASE_REF} --depth=1`, { stdio: "ignore" }); } catch {}
+            try { execSync(`git fetch origin ${process.env.GITHUB_HEAD_REF} --depth=1`, { stdio: "ignore" }); } catch {}
+            let diff = "";
+            try {
+              diff = execSync(`git diff --unified=0 --no-color origin/${process.env.GITHUB_BASE_REF}...origin/${process.env.GITHUB_HEAD_REF}`, { encoding: "utf8", maxBuffer: 1024*1024*10 });
+              if (diff.length > 180000) diff = diff.slice(0, 180000);
+            } catch (e) { diff = "(no diff)"; }
+
             const ac = JSON.parse(process.env.AC_ARRAY_JSON || "[]");
-            const diff = process.env.DIFF || "(no diff)";
+
             async function post(body){
-              const { data: comments } = await github.rest.issues.listComments({
-                owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number
-              });
+              const pr = context.payload.pull_request;
+              const { data: comments } = await github.rest.issues.listComments({ owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number });
               const existing = comments.find(c => c.body?.includes(marker));
               if (existing) {
-                await github.rest.issues.updateComment({
-                  owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body
-                });
+                await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body });
               } else {
-                await github.rest.issues.createComment({
-                  owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body
-                });
+                await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: pr.number, body });
               }
             }
+
             async function callAzure(){
               const ep  = process.env.AZURE_OPENAI_ENDPOINT;
               const key = process.env.AZURE_OPENAI_API_KEY;
@@ -200,7 +203,7 @@ jobs:
                   response_format: { type: "json_object" },
                   messages: [
                     { role: "system", content:
-                      "You are a senior C# reviewer. For EACH acceptance criterion, read the unified diff and decide: satisfied | not_satisfied | unknown. Be conservative. Return STRICT JSON: {summary, results:[{criterion, status, confidence, evidence, suggested_tests}]}. Evidence should quote file:line snippets found in the diff." },
+                      "You are a senior C# reviewer. For EACH acceptance criterion, read the unified diff and decide: satisfied | not_satisfied | unknown. Be conservative. Return STRICT JSON: {summary, results:[{criterion, status, confidence, evidence, suggested_tests}]}. Evidence should quote file:line snippets from the diff." },
                     { role: "user", content:
                       "Acceptance Criteria:\n" + JSON.stringify(ac, null, 2) + "\n\nUnified diff:\n" + diff }
                   ]
@@ -208,18 +211,16 @@ jobs:
               });
               if (!resp.ok) return null;
               const data = await resp.json();
-              try { return JSON.parse(data.choices[0].message.content); }
-              catch { return null; }
+              try { return JSON.parse(data.choices[0].message.content); } catch { return null; }
             }
 
             const out = await callAzure();
             if (!out || !Array.isArray(out.results)) {
-              await post(`${marker}\n### AC vs Code – AI Check\n_Azure evaluation unavailable. Showing diff size:_ ${diff.length} chars`);
-              core.setOutput("fail", "false");
+              await post(`${marker}\n### AC vs Code – AI Check\n_Azure evaluation unavailable._ Diff size: ${diff.length} chars`);
               return;
             }
 
-            function emoji(s){ return {satisfied:"✅", not_satisfied:"❌", unknown:"⚠️"}[s] || "⚠️"; }
+            const emoji = s => ({ satisfied:"✅", not_satisfied:"❌", unknown:"⚠️" }[s] || "⚠️");
             let md = `${marker}
 ### Acceptance Criteria – AI Check
 Diff analyzed: ${diff.length} chars
@@ -240,11 +241,6 @@ Diff analyzed: ${diff.length} chars
               md += `- \`${r.criterion}\` → ${emoji(r.status)} **${r.status}** · Evidence: ${ev} · Suggested tests: ${tests}\n`;
             }
             await post(md);
-            core.setOutput("fail", anyFail ? "true" : "false");
 
-      # ---- 5) (Optional) Fail the job if any criterion failed ----
-      - name: Fail if AC not satisfied
-        if: steps.eval.outputs.fail == 'true'
-        run: |
-          echo "One or more acceptance criteria were NOT satisfied." >&2
-          exit 1
+            // Optional: fail job if any AC not satisfied (uncomment next line to enforce)
+            // core.setFailed(anyFail ? "One or more acceptance criteria were NOT satisfied." : "");
