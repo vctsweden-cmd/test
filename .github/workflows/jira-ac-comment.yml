@@ -1,20 +1,20 @@
-name: Jira AC → PR comment (Azure + fallback)
+name: Jira AC → Job Summary (Azure + fallback, no PR comment)
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited, labeled]
 
 permissions:
-  contents: read
-  pull-requests: write
+  contents: read       # no "pull-requests: write" needed anymore
 
 jobs:
-  ac_comment:
+  ac_summary:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Post AC from Jira
+      - name: Fetch AC from Jira (Azure OpenAI + fallback)
+        id: ac
         uses: actions/github-script@v7
         env:
           JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
@@ -26,6 +26,49 @@ jobs:
           AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
         with:
           script: |
-            const marker = "<!-- ac-azure-jira -->";
+            const pr = context.payload.pull_request || {};
+            const title = pr.title || "";
+            const body  = pr.body  || "";
+            const head  = pr.head?.ref || "";
+            const base  = pr.base?.ref || "";
 
-            // --- Find a Jira key in title/body/branches/commits or label "jira:KEY" ---
+            // Optional label like jira:ABC-123
+            let labelKey = null;
+            if (Array.isArray(pr.labels)) {
+              const hit = pr.labels.find(l => /^jira:/i.test(l.name || ""));
+              if (hit) labelKey = (hit.name.split(":")[1] || "").trim();
+            }
+
+            // Also search commit messages
+            const commits = await github.rest.pulls.listCommits({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              per_page: 250
+            });
+            const commitText = commits.data.map(c => c.commit?.message || "").join("\n");
+
+            // Find Jira key(s)
+            const haystack = [title, body, head, base, labelKey, commitText].filter(Boolean).join("\n");
+            const re = /\b([A-Z][A-Z0-9]+-\d+)\b/gi;
+            const keys = new Set(); let m;
+            while ((m = re.exec(haystack)) !== null) keys.add(m[1].toUpperCase());
+            if (!keys.size) {
+              core.setOutput("key", "");
+              core.setOutput("markdown", "_No Jira key found in PR title/body/branch/commits/labels._");
+              return;
+            }
+            const key = [...keys][0];
+
+            // Jira fetch
+            const baseUrl = process.env.JIRA_BASE_URL;
+            const email   = process.env.JIRA_EMAIL;
+            const token   = process.env.JIRA_API_TOKEN;
+            if (!baseUrl || !email || !token) {
+              core.setFailed("Missing one of: JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN");
+              return;
+            }
+            const auth = "Basic " + Buffer.from(email + ":" + token).toString("base64");
+            const url  = baseUrl.replace(/\/+$/,"") + "/rest/api/3/issue/" + encodeURIComponent(key);
+            const r = await fetch(url, { headers: { "Accept":"application/json", "Authorization": auth } });
+            if (
