@@ -24,33 +24,43 @@ jobs:
         with:
           script: |
             const marker = "<!-- ac-ai-jira -->";
+
+            // ---- PR context ----
             const pr = context.payload.pull_request || {};
             const title  = pr.title || "";
             const body   = pr.body  || "";
             const branch = (pr.head && pr.head.ref) ? pr.head.ref : "";
 
-            // Find first Jira key like ABC-123
+            // ---- Find Jira key like ABC-123 ----
             const found = (title + "\n" + body + "\n" + branch).match(/\b([A-Z][A-Z0-9]+-\d+)\b/g) || [];
-            if (!found.length) {
+            if (found.length === 0) {
               const msg = `${marker}\n_No Jira key found in PR title/body/branch._`;
               const { data: comments } = await github.rest.issues.listComments({
-                owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number
               });
               const existing = comments.find(c => c.body && c.body.includes(marker));
               if (existing) {
                 await github.rest.issues.updateComment({
-                  owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body: msg
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body: msg
                 });
               } else {
                 await github.rest.issues.createComment({
-                  owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body: msg
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: msg
                 });
               }
               return;
             }
             const key = found[0];
 
-            // Fetch Jira issue JSON
+            // ---- Validate secrets ----
             const baseUrl = process.env.JIRA_BASE_URL;
             const email   = process.env.JIRA_EMAIL;
             const token   = process.env.JIRA_API_TOKEN;
@@ -59,46 +69,59 @@ jobs:
               core.setFailed("Missing one of: JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, OPENAI_API_KEY");
               return;
             }
-            const auth = "Basic " + Buffer.from(`${email}:${token}`).toString("base64");
-            const url  = `${baseUrl}/rest/api/3/issue/${encodeURIComponent(key)}?expand=renderedFields`;
+
+            // ---- Fetch Jira issue ----
+            const auth = "Basic " + Buffer.from(email + ":" + token).toString("base64");
+            const url  = baseUrl.replace(/\/+$/,"") + "/rest/api/3/issue/" + encodeURIComponent(key) + "?expand=renderedFields";
             const r = await fetch(url, { headers: { "Accept":"application/json", "Authorization": auth } });
-            if (!r.ok) throw new Error(`Jira fetch failed: ${r.status} ${await r.text()}`);
+            if (!r.ok) {
+              throw new Error("Jira fetch failed: " + r.status + " " + (await r.text()));
+            }
             const issue = await r.json();
 
-            // Ask OpenAI to extract AC -> Markdown bullets
+            // ---- Ask OpenAI to extract AC as Markdown bullets ----
             const messages = [
-              { role: "system", content:
-                "Extract Acceptance Criteria from this Jira issue JSON. Prefer any obvious custom field; otherwise parse the Description (Atlassian rich-text). Return ONLY Markdown bullets, one per criterion. If none, return '- (none found)'." },
-              { role: "user", content: `Jira key: ${key}\nIssue JSON:\n${JSON.stringify(issue)}` }
+              { role: "system", content: "Extract Acceptance Criteria from this Jira issue JSON. Prefer any obvious custom field; otherwise parse the Description (Atlassian rich-text). Return ONLY Markdown bullets, one per criterion. If none, return '- (none found)'." },
+              { role: "user", content: "Jira key: " + key + "\nIssue JSON:\n" + JSON.stringify(issue) }
             ];
             const ai = await fetch("https://api.openai.com/v1/chat/completions", {
               method: "POST",
-              headers: { "Authorization": `Bearer ${openai}`, "Content-Type":"application/json" },
-              body: JSON.stringify({ model: "gpt-4.1-mini", temperature: 0, messages })
+              headers: { "Authorization": "Bearer " + openai, "Content-Type":"application/json" },
+              body: JSON.stringify({ model: "gpt-4.1-mini", temperature: 0, messages: messages })
             });
-            if (!ai.ok) throw new Error(`OpenAI ${ai.status}: ${await ai.text()}`);
+            if (!ai.ok) {
+              throw new Error("OpenAI " + ai.status + ": " + (await ai.text()));
+            }
             const data = await ai.json();
-            const acListMd = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content
-                              ? data.choices[0].message.content.trim()
-                              : "- (none found)");
+            const acListMd =
+              (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content)
+                ? data.choices[0].message.content.trim()
+                : "- (none found)";
 
-            // Upsert PR comment
-            const bodyMd = `${marker}
-### Jira Acceptance Criteria
-**${key}**
+            // ---- Upsert PR comment ----
+            const bodyMd = marker + "\n" +
+              "### Jira Acceptance Criteria\n" +
+              "**" + key + "**\n\n" +
+              acListMd + "\n";
 
-${acListMd}
-`;
             const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
             });
             const existing = comments.find(c => c.body && c.body.includes(marker));
             if (existing) {
               await github.rest.issues.updateComment({
-                owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body: bodyMd
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: bodyMd
               });
             } else {
               await github.rest.issues.createComment({
-                owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body: bodyMd
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: bodyMd
               });
             }
